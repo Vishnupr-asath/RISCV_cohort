@@ -131,3 +131,43 @@ Both **UART** and **AXI** play vital roles in digital communication systems:
 - **AXI** is optimized for **high-speed data transfer** within SoCs, connecting processors and memory blocks efficiently.
 
 ---
+## Steps involved in uart 64-bit verification
+Step 1: Install cocotbext-axi (Branch: axi-64bit)
+```bash
+
+1. Clone the repository
+git clone https://github.com/vyomasystems/cocotbext-axi.git
+
+2. Enter the directory
+cd cocotbext-axi
+
+3. Switch to the 64-bit branch
+git checkout axi-64bit
+
+4. Install in editable mode (don't forget the dot at the end!)
+pip install -e .
+```
+Step 2: Install cocotbext-uart (Branch: parity_update)
+```Bash
+
+1. Go back to your main folder (step out of the axi folder)
+cd ..
+
+2. Clone the repository
+git clone https://github.com/vyomasystems/cocotbext-uart.git
+
+3. Enter the directory
+cd cocotbext-uart
+
+4. Switch to the parity update branch
+git checkout parity_update
+
+# 5. Install in editable mode
+pip install -e .
+```
+Step 3: Run
+```bash
+make
+```
+------
+
