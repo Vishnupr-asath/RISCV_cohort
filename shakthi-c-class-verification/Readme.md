@@ -162,7 +162,7 @@ cd cocotbext-uart
 4. Switch to the parity update branch
 git checkout parity_update
 
-# 5. Install in editable mode
+5. Install in editable mode
 pip install -e .
 ```
 Step 3: Run
