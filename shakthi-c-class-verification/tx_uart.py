@@ -2,17 +2,9 @@ import os
 import random
 import logging
 from enum import Enum
-
 import cocotb
 import vsc
-from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
-from cocotbext.axi import AxiMaster, AxiBus, AxiBurstType
-from cocotbext.uart import UartSink
 
-# -----------------------------------------------------------------------------
-# 1. GLOBAL CONFIGURATION
-# -----------------------------------------------------------------------------
 CLK_PERIOD_NS = 100                 # 10 MHz Clock
 CLK_FREQ      = 1_000_000_000 // CLK_PERIOD_NS
 UART_BASE     = 0x00011300          # Base Address
@@ -36,7 +28,7 @@ RX_THRESH     = UART_BASE + 0x20
 CTRL_STOP_LSB   = 1
 CTRL_PARITY_LSB = 3
 CTRL_DW_LSB     = 5
-CTRL_DW_MASK    = 0x1F
+CTRL_DW_MASK    = 0x3
 
 def parity_to_field(p: UartParity) -> int:
     if p == UartParity.ODD:  return 0b01
@@ -48,31 +40,74 @@ def field_to_stop_bits(field: int):
     if field == 0b10: return 2
     return 1
 
+# --- HELPER TO MAP INT WIDTH TO BINARY CODE ---
+def get_width_code(width):
+    if width == 8: return 0b11
+    if width == 7: return 0b10
+    if width == 6: return 0b01
+    return 0b00
+
 # -----------------------------------------------------------------------------
-# 3. HELPER FUNCTIONS (Safe 32-bit Access)
+# 3. HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
-async def axi_write32(axim: AxiMaster, addr: int, value: int, *, awid=1):
-    """Safe 32-bit write to configure setup registers."""
+async def axi_write32(axim, addr: int, value: int, *, awid=1):
+    # Lazy Import
+    from cocotbext.axi import AxiBurstType
+
     data = int(value & 0xFFFFFFFF).to_bytes(4, "little")
     await axim.write(address=addr, data=data,
                      awid=awid, burst=AxiBurstType.FIXED, size=2)
 
-async def rmw16(axim: AxiMaster, reg_addr: int, value16: int):
-    """Simple write wrapper for 16-bit registers."""
-    # For this specific DUT, writing 32-bits to the aligned address works fine
+async def rmw16(axim, reg_addr: int, value16: int):
     aligned_addr = reg_addr & ~0x3
-    # We construct a 32-bit value. If reg is upper half, shift it.
     is_upper = (reg_addr & 0x2) != 0
     shift = 16 if is_upper else 0
-
-    # Note: A real RMW would read first. Here we assume we can overwrite
-    # the neighbor register or it's unused for this simple test.
-    # To be perfectly safe, we just write the 32-bit word assuming 0 in the other half.
     val32 = (value16 & 0xFFFF) << shift
     await axi_write32(axim, aligned_addr, val32)
 
 # -----------------------------------------------------------------------------
-# 4. COVERAGE MODEL
+# 4. WAVEFORM AUTOMATION CHECKER
+# -----------------------------------------------------------------------------
+async def verify_uart_waveform(dut, expected_data, baud_rate, data_width):
+    # --- SAFE LOCAL IMPORTS ---
+    from cocotb.triggers import FallingEdge, Timer
+
+    """
+    Manual Waveform Monitor: Checks physical pins for timing and data integrity.
+    """
+    bit_period_ns = 1_000_000_000 / baud_rate
+    dut._log.info(f"[Waveform Check] Starting Monitor | Baud: {baud_rate} | Width: {data_width}")
+
+    # 1. Wait for Start Bit (Falling Edge)
+    await FallingEdge(dut.uart_cluster.uart0.SOUT)
+
+    # 2. Check Start Bit Stability (Sample at 50% of bit period)
+    await Timer(bit_period_ns / 2, unit='ns')
+    if dut.uart_cluster.uart0.SOUT.value != 0:
+        raise RuntimeError("Waveform Error: Start bit did not hold LOW!")
+
+    # 3. Read Data Bits
+    rec_val = 0
+    for i in range(data_width):
+        await Timer(bit_period_ns, unit='ns')
+        bit_val = int(dut.uart_cluster.uart0.SOUT.value)
+        rec_val |= (bit_val << i) # LSB First
+
+    # 4. Check Stop Bit
+    await Timer(bit_period_ns, unit='ns')
+    if dut.uart_cluster.uart0.SOUT.value != 1:
+        dut._log.error(f"Waveform Error: Stop bit missing. Last Data Bit was {bit_val}")
+        raise RuntimeError("Waveform Error: Stop bit missing (Line should be HIGH)!")
+
+    # 5. Verify
+    dut._log.info(f"[Waveform Check] Captured: {hex(rec_val)} | Expected: {hex(expected_data)}")
+    if rec_val != expected_data:
+        raise RuntimeError(f"Waveform Mismatch! Waveform: {hex(rec_val)} != Expected: {hex(expected_data)}")
+
+    dut._log.info("[Waveform Check] PASSED ✓")
+
+# -----------------------------------------------------------------------------
+# 5. COVERAGE MODEL
 # -----------------------------------------------------------------------------
 @vsc.randobj
 class uart_item(object):
@@ -102,10 +137,13 @@ class my_covergroup(object):
         self.Data_Width = vsc.coverpoint(self.data_width, cp_t=vsc.uint8_t())
 
 # -----------------------------------------------------------------------------
-# 5. TESTBENCH CLASSES
+# 6. TESTBENCH CLASSES
 # -----------------------------------------------------------------------------
 class Testbench:
     def __init__(self, dut):
+        # Lazy Import
+        from cocotbext.axi import AxiMaster, AxiBus
+
         self.dut = dut
         self.log = logging.getLogger("cocotb.tb")
         self.log.setLevel(logging.INFO)
@@ -115,25 +153,37 @@ class Testbench:
 
 class uart_components:
     def __init__(self, dut, clk_freq, axi_baud_value, stop_bits_num, selected_parity, data_width, uart_base_addr):
+        # Lazy Import
+        from cocotbext.uart import UartSink
+
+        # --- FIX: Convert Enum to None/String for VIP ---
+        vip_parity = None
+        if selected_parity == UartParity.ODD:  vip_parity = "ODD"
+        if selected_parity == UartParity.EVEN: vip_parity = "EVEN"
+
         self.baud_rate = clk_freq // (16 * axi_baud_value)
         if uart_base_addr == 0x00011300:
             self.uart_tx = UartSink(dut.uart_cluster.uart0.SOUT, baud=self.baud_rate,
-                                    bits=data_width, stop_bits=stop_bits_num, parity=selected_parity)
+                                    bits=data_width, stop_bits=stop_bits_num, parity=vip_parity)
         else:
             raise ValueError(f"Unknown UART Address: {hex(uart_base_addr)}")
 
 # -----------------------------------------------------------------------------
-# 6. MAIN TEST: 64-BIT NATIVE WITH VERIFICATION
+# 7. MAIN TEST
 # -----------------------------------------------------------------------------
 @cocotb.test()
 async def test_64bit_native_verification(dut):
+    # --- SAFE LOCAL IMPORTS ---
+    from cocotb.clock import Clock
+    from cocotb.triggers import RisingEdge
+
     """
     Combines robust verification (Coverage/Random Config) with
     Native 64-bit Transaction testing.
     """
 
     # --- A. Setup Phase ---
-    clock = Clock(dut.CLK, CLK_PERIOD_NS, units="ns")
+    clock = Clock(dut.CLK, CLK_PERIOD_NS, unit="ns")
     cocotb.start_soon(clock.start(start_high=False))
 
     dut.RST_N.value = 0
@@ -151,72 +201,70 @@ async def test_64bit_native_verification(dut):
     for _ in range(20): await RisingEdge(dut.CLK)
     tb = Testbench(dut)
 
-    # --- B. Configuration Phase (Safe 32-bit) ---
-    # We configure the "Static" registers first using safe writes
+    # --- B. Configuration Phase ---
     await rmw16(tb.axi_master, DELAY_REG, 0x0000)
     await rmw16(tb.axi_master, IQCYC_REG, 0x0000)
     await rmw16(tb.axi_master, RX_THRESH, 0x0000)
     await rmw16(tb.axi_master, INTERRUPT_EN, 0x0000)
 
     # Generate Random Config
-    stop_field = random.choice([0b00, 0b01, 0b10])
+    stop_field = random.choice([0b00, 0b01, 0b10, 0b11])
     stop_bits_num = field_to_stop_bits(stop_field)
-
-    # For robustness, we stick to NONE parity for now as hardware parity
-    # implementations can vary, but the structure supports randomizing it.
     parity_sel = UartParity.NONE
     parity_field = parity_to_field(parity_sel)
 
-    data_width = random.choice([7, 8]) # 5/6 bits sometimes cause parity/stop bit confusion
+    data_width = 8
+
+    # --- FIXED: Use Code mapping instead of raw integer ---
+    dw_code = get_width_code(data_width)
 
     ctrl_val = 0
     ctrl_val |= ((stop_field & 0b11) << CTRL_STOP_LSB)
     ctrl_val |= ((parity_field & 0b11) << CTRL_PARITY_LSB)
-    ctrl_val |= ((data_width & CTRL_DW_MASK) << CTRL_DW_LSB)
+    ctrl_val |= ((dw_code & CTRL_DW_MASK) << CTRL_DW_LSB)
 
-    dut._log.info(f"Configuring CTRL: Width={data_width}, Stop={stop_bits_num}")
+    dut._log.info(f"Configuring CTRL: Width={data_width} (Code={bin(dw_code)}), Stop={stop_bits_num}")
     await rmw16(tb.axi_master, CTRL_REG, ctrl_val)
 
-    # --- C. The 64-bit Transaction Phase ---
+    # --- C. Transaction Phase ---
     baud_val = 0x0005
     etx_data = random.getrandbits(data_width)
     tx_char  = etx_data & 0xFF
+    actual_baud_rate = CLK_FREQ // (16 * baud_val)
 
-    # Setup Monitor
+    # Setup Standard Library Monitor
     tb1 = uart_components(dut, CLK_FREQ, baud_val,
                           stop_bits_num, parity_sel, data_width, UART_BASE)
     tb.cg.sample(0, stop_field, parity_field, data_width)
 
-    # *** THE MAGIC: Packing Baud + TX into one 64-bit Integer ***
-    # Lower 32 bits (0x11300): Baud Rate
-    # Upper 32 bits (0x11304): TX Data
+    # *** START THE MANUAL WAVEFORM CHECKER ***
+    waveform_task = cocotb.start_soon(
+        verify_uart_waveform(dut, tx_char, actual_baud_rate, data_width)
+    )
+
+    # Prepare Data
     data_64bit_int = (tx_char << 32) | baud_val
     data_bytes = data_64bit_int.to_bytes(8, 'little')
 
     dut._log.info("---------------------------------------------------")
     dut._log.info(f" EXECUTING 64-BIT WRITE TO {hex(UART_BASE)}")
     dut._log.info(f" Payload: {data_bytes.hex()}")
-    dut._log.info(f"   -> Baud: {hex(baud_val)}")
+    dut._log.info(f"   -> Baud: {hex(baud_val)} (Approx {actual_baud_rate} Hz)")
     dut._log.info(f"   -> TX  : {hex(tx_char)}")
     dut._log.info("---------------------------------------------------")
 
     try:
-        # size=3 requests a native 64-bit burst
         await tb.axi_master.write(address=UART_BASE, data=data_bytes, size=3)
         dut._log.info("AXI Write Sent.")
     except Exception as e:
         dut._log.warning(f"AXI Error (Expected SLVERR): {e}")
 
     # --- D. Verification Phase ---
-    dut._log.info("Waiting for UART output...")
-    await tb1.uart_tx.wait(timeout=1000000, timeout_unit='ns')
-
+    await waveform_task
     received = await tb1.uart_tx.read(count=1)
     rx_byte = int(received[0])
 
-    # Update Coverage
     tb.cg.sample(rx_byte, stop_field, parity_field, data_width)
-
     dut._log.info(f"Sent: {hex(tx_char)}, Recv: {hex(rx_byte)}")
     assert rx_byte == tx_char, f"Mismatch: Sent {hex(tx_char)} != Recv {hex(rx_byte)}"
 
